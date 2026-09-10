@@ -55,7 +55,8 @@ jobs:
           set -euo pipefail
 
           SHOULD_BUILD=true
-          PLATFORMS="${NOTES_PLATFORMS}"
+          # Only build iOS. Skip macOS builds.
+          PLATFORMS='["ios"]'
 
           if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
             MATCHING_TAGS="$(git tag --points-at "${GITHUB_SHA}" --list 'v*')"
@@ -65,27 +66,16 @@ jobs:
               echo "Skipping main commit already covered by tag builds / 跳过已由标签构建覆盖的 main 分支提交：${MATCHING_TAGS}"
             fi
           elif [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-            if [[ "${GITHUB_REF_NAME}" == *_mac ]]; then
-              if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+_mac$ ]]; then
-                echo "::error::macOS tags must use v<major>.<minor>.<patch>_mac / 桌面端标签格式错误"
-                exit 1
-              fi
-              if [[ "${HAS_MACOS}" != "true" ]]; then
-                echo "::error::A macOS tag requires non-empty bilingual macOS release notes / 桌面端标签要求 macOS 双语更新日志非空"
-                exit 1
-              fi
-              PLATFORMS='["macos"]'
-            else
-              if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                echo "::error::Mobile tags must use v<major>.<minor>.<patch> / 移动端标签格式错误"
-                exit 1
-              fi
-              if [[ "${HAS_IOS}" != "true" ]]; then
-                echo "::error::A mobile tag requires non-empty bilingual iOS + Apple Watch release notes / 移动端标签要求双语更新日志非空"
-                exit 1
-              fi
-              PLATFORMS='["ios"]'
+            # Always build iOS for any tag.
+            if [[ ! "${GITHUB_REF_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Mobile tags must use v<major>.<minor>.<patch> / 移动端标签格式错误"
+              exit 1
             fi
+            if [[ "${HAS_IOS}" != "true" ]]; then
+              echo "::error::A mobile tag requires non-empty bilingual iOS + Apple Watch release notes / 移动端标签要求双语更新日志非空"
+              exit 1
+            fi
+            PLATFORMS='["ios"]'
           fi
 
           echo "should_build=${SHOULD_BUILD}" >> "${GITHUB_OUTPUT}"
