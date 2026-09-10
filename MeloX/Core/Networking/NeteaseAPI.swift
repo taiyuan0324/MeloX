@@ -512,29 +512,36 @@ final class NeteaseAPI {
                     count: limit,
                     pages: 1
                 )
-                let songs = results.compactMap { result -> Song? in
-                    guard let songID = Int(result.id) else { return nil }
-                    let artistNames = (result.artist ?? "").split(separator: ",").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-                    let artists = artistNames.enumerated().compactMap { index, name in
-                        guard !name.isEmpty else { return nil }
-                        return Artist(id: index + 1, name: String(name))
+                var songs: [Song] = []
+                for result in results {
+                    guard let songID = Int(result.id) else { continue }
+                    let artistNames = (result.artist ?? "")
+                        .split(separator: ",")
+                        .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                        .filter { !$0.isEmpty }
+                    var artists: [Artist] = []
+                    for (index, name) in artistNames.enumerated() {
+                        artists.append(Artist(id: index + 1, name: name))
                     }
-                    let album = result.album.flatMap { name in
-                        Album(
+                    let album: Album?
+                    if let albumName = result.album {
+                        album = Album(
                             id: 0,
-                            name: name,
+                            name: albumName,
                             picURL: nil,
                             artists: artists
                         )
+                    } else {
+                        album = nil
                     }
-                    return Song(
+                    songs.append(Song(
                         id: songID,
                         name: result.name,
                         artists: artists,
                         album: album,
                         durationMS: 0,
                         audioAvailability: .unknown
-                    )
+                    ))
                 }
                 return SearchPayload(
                     songs: songs,
