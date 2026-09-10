@@ -62,6 +62,9 @@ final class NeteaseAPI {
     @ObservationIgnored
     let client: NeteaseDirectClient
 
+    @ObservationIgnored
+    let gdstudioAPI: GdstudioMusicAPI
+
     private var playbackQuality: MusicQuality {
         isCellularData ? settings.cellularQuality : settings.quality
     }
@@ -69,6 +72,7 @@ final class NeteaseAPI {
     init(settings: AppSettings, session: URLSession = .shared) {
         self.settings = settings
         client = NeteaseDirectClient(settings: settings, session: session)
+        gdstudioAPI = GdstudioMusicAPI(session: session)
         pathMonitor.pathUpdateHandler = { [weak self] path in
             let isCellular = path.usesInterfaceType(.cellular)
             Task { @MainActor [weak self] in
@@ -419,29 +423,36 @@ final class NeteaseAPI {
         id: Int,
         quality: MusicQuality
     ) async throws -> PlaybackSource {
-        // Mirrors @neteaseapireborn/api/module/song_url_v1.js.
-        var data: [String: Any] = [
-            "ids": "[\(id)]",
-            "level": quality.apiLevel,
-            "encodeType": "flac",
-        ]
-        if quality.requiresImmersiveType {
-            data["immerseType"] = "c51"
-        }
-        let response: SongURLResponse = try await client.eapi(
-            "/api/song/enhance/player/url/v1",
-            data: data
+        // Use the third-party gdstudio music API to resolve playback URLs.
+        // Map MeloX quality levels to gdstudio bitrate values:
+        //   128 -> 128 (standard)
+        //   320 -> 320 (high)
+        //   flac/hires/others -> 740 or 999 (lossless)
+        let br: Int = {
+            switch quality {
+            case .standard: 128
+            case .high: 320
+            case .lossless, .hiResolution,
+                 .highDefinitionSurround, .immersiveSurround,
+                 .ultraClearMaster: 999
+            }
+        }()
+
+        let source = try await gdstudioAPI.songURL(
+            id: String(id),
+            source: "netease",
+            br: br
         )
-        guard let source = response.data.first(where: { $0.id == id }),
-              let string = source.url,
-              let url = securePlaybackURL(from: string) else {
+        guard let urlString = source.url,
+              let url = URL(string: urlString),
+              !url.absoluteString.isEmpty else {
             throw APIError.noPlayableSource
         }
         return PlaybackSource(
             url: url,
-            bitrate: source.bitrate,
-            format: source.format,
-            quality: source.level.flatMap(MusicQuality.init(apiLevel:))
+            bitrate: source.br,
+            format: url.pathExtension.isEmpty ? "mp3" : url.pathExtension,
+            quality: quality
         )
     }
 
@@ -483,31 +494,8 @@ final class NeteaseAPI {
         id: Int,
         quality: MusicQuality
     ) async throws -> PlaybackSource {
-        // Mirrors @neteaseapireborn/api/module/song_download_url_v1.js.
-        var data: [String: Any] = [
-            "id": id,
-            "level": quality.apiLevel,
-        ]
-        if quality.requiresImmersiveType {
-            data["immerseType"] = "c51"
-        }
-        let response: SongDownloadURLResponse = try await client.eapi(
-            "/api/song/enhance/download/url/v1",
-            data: data
-        )
-        guard let source = response.data,
-              source.id == id,
-              source.freeTrialInfo == nil,
-              let string = source.url,
-              let url = securePlaybackURL(from: string) else {
-            throw APIError.noPlayableSource
-        }
-        return PlaybackSource(
-            url: url,
-            bitrate: source.bitrate,
-            format: source.format,
-            quality: source.level.flatMap(MusicQuality.init(apiLevel:))
-        )
+        // Downloads use the same gdstudio URL endpoint as playback.
+        try await requestPlaybackSource(id: id, quality: quality)
     }
 
     func songURL(id: Int) async throws -> URL {
@@ -515,6 +503,53 @@ final class NeteaseAPI {
     }
 
     func search(_ keywords: String, kind: SearchKind, limit: Int = 30) async throws -> SearchPayload {
+        // Use the gdstudio API for song searches when searching for songs.
+        if kind == .songs {
+            do {
+                let results = try await gdstudioAPI.search(
+                    name: keywords,
+                    source: "netease",
+                    count: limit,
+                    pages: 1
+                )
+                let songs = results.compactMap { result -> Song? in
+                    guard let songID = Int(result.id) else { return nil }
+                    let artistNames = (result.artist ?? "").split(separator: ",").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
+                    let artists = artistNames.enumerated().compactMap { index, name in
+                        guard !name.isEmpty else { return nil }
+                        return Artist(id: index + 1, name: String(name))
+                    }
+                    let album = result.album.flatMap { name in
+                        Album(
+                            id: 0,
+                            name: name,
+                            picURL: nil,
+                            artists: artists
+                        )
+                    }
+                    return Song(
+                        id: songID,
+                        name: result.name,
+                        artists: artists,
+                        album: album,
+                        durationMS: 0,
+                        audioAvailability: .unknown
+                    )
+                }
+                return SearchPayload(
+                    songs: songs,
+                    albums: nil,
+                    artists: nil,
+                    playlists: nil,
+                    podcasts: nil
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Fall back to the original NetEase search API.
+            }
+        }
+
         let response: SearchResponse = try await client.eapi(
             "/api/search/get",
             data: ["s": keywords, "type": kind.rawValue, "limit": limit, "offset": 0]
@@ -572,48 +607,69 @@ final class NeteaseAPI {
     }
 
     func neteaseLyrics(id: Int) async throws -> NeteaseLyricPayload {
+        // First try the gdstudio API for lyrics, falling back to the
+        // original NetEase endpoint if gdstudio is unavailable.
         do {
-            let response: LyricResponse = try await client.eapi(
-                "/api/song/lyric/v1",
-                data: [
-                    "id": id,
-                    "cp": false,
-                    "tv": 0,
-                    "lv": 0,
-                    "rv": 0,
-                    "kv": 0,
-                    "yv": 0,
-                    "ytv": 0,
-                    "yrv": 0,
-                ]
+            let result = try await gdstudioAPI.lyrics(
+                id: String(id),
+                source: "netease"
             )
             return NeteaseLyricPayload(
-                yrc: response.yrc?.lyric,
-                lrc: response.lrc?.lyric,
-                translatedYRC: response.ytlrc?.lyric,
-                translatedLRC: response.tlyric?.lyric,
-                romanizedYRC: response.yromalrc?.lyric,
-                romanizedLRC: response.romalrc?.lyric,
-                isPureMusic: response.pureMusic == true
+                yrc: nil,
+                lrc: result.lyric,
+                translatedYRC: nil,
+                translatedLRC: result.tlyric,
+                romanizedYRC: nil,
+                romanizedLRC: nil,
+                isPureMusic: result.lyric?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true
             )
         } catch is CancellationError {
             throw CancellationError()
         } catch {
-            // Keep line-synced lyrics available when the newer YRC route is
-            // temporarily unavailable for a region or catalog item.
-            let response: LyricResponse = try await client.eapi(
-                "/api/song/lyric",
-                data: ["id": id, "tv": -1, "lv": -1, "rv": -1, "kv": -1, "_nmclfl": 1]
-            )
-            return NeteaseLyricPayload(
-                yrc: nil,
-                lrc: response.lrc?.lyric,
-                translatedYRC: nil,
-                translatedLRC: response.tlyric?.lyric,
-                romanizedYRC: nil,
-                romanizedLRC: response.romalrc?.lyric,
-                isPureMusic: response.pureMusic == true
-            )
+            // Fall back to the original NetEase lyrics API.
+            do {
+                let response: LyricResponse = try await client.eapi(
+                    "/api/song/lyric/v1",
+                    data: [
+                        "id": id,
+                        "cp": false,
+                        "tv": 0,
+                        "lv": 0,
+                        "rv": 0,
+                        "kv": 0,
+                        "yv": 0,
+                        "ytv": 0,
+                        "yrv": 0,
+                    ]
+                )
+                return NeteaseLyricPayload(
+                    yrc: response.yrc?.lyric,
+                    lrc: response.lrc?.lyric,
+                    translatedYRC: response.ytlrc?.lyric,
+                    translatedLRC: response.tlyric?.lyric,
+                    romanizedYRC: response.yromalrc?.lyric,
+                    romanizedLRC: response.romalrc?.lyric,
+                    isPureMusic: response.pureMusic == true
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Keep line-synced lyrics available when the newer YRC route is
+                // temporarily unavailable for a region or catalog item.
+                let response: LyricResponse = try await client.eapi(
+                    "/api/song/lyric",
+                    data: ["id": id, "tv": -1, "lv": -1, "rv": -1, "kv": -1, "_nmclfl": 1]
+                )
+                return NeteaseLyricPayload(
+                    yrc: nil,
+                    lrc: response.lrc?.lyric,
+                    translatedYRC: nil,
+                    translatedLRC: response.tlyric?.lyric,
+                    romanizedYRC: nil,
+                    romanizedLRC: response.romalrc?.lyric,
+                    isPureMusic: response.pureMusic == true
+                )
+            }
         }
     }
 
